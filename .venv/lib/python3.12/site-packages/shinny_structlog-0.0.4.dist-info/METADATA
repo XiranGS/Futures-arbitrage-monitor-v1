@@ -1,0 +1,568 @@
+Metadata-Version: 2.1
+Name: shinny-structlog
+Version: 0.0.4
+Summary: Shinny StructLog
+Home-page: https://github.com/shinnytech/structlog-python
+Author: TianQin
+Author-email: tianqincn@gmail.com
+License: UNKNOWN
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+
+# structlog-python
+
+根据 [日志规范](https://shinnytech.atlassian.net/wiki/spaces/TWG/pages/161153315)，实现的 python 版本的日志库。
+
+基于 python 自带 logging 模块的简单封装。
+
+# 目录
+
+* [logging 模块处理流程](#logging-模块处理流程)
+* [本库遵循的日志规范](#本库遵循的日志规范)
+* [安装](#安装)
+* [结构化](#结构化)
+* [上下文](#上下文)
+    * [1. 打印日志，使用 extra 字段表示上下文信息。](#1-打印日志使用-extra-字段表示上下文信息)
+    * [2. 使用 ShinnyLoggerAdapter 维护 context 信息](#2-使用-shinnyloggeradapter-维护-context-信息)
+* [日志源头及优先级](#日志源头及优先级)
+    * [1. context 信息](#1-context-信息)
+    * [2. logger.debug 时提供的字段](#2-loggerdebug-时提供的字段)
+    * [3. shinny_structlog.JSONFormatter 自动生成的字段](#3-shinny_structlogjsonformatter-自动生成的字段)
+* [使用示例及注意事项](#使用示例及注意事项)
+    * [不使用本日志库](#不使用本日志库)
+    * [结构化日志](#结构化日志)
+    * [日志添加额外字段](#日志添加额外字段)
+    * [LogRecord 本身带有的属性](#logrecord-本身带有的属性)
+    * [上下文表示](#上下文表示)
+    * [上下文继承](#上下文继承)
+
+## logging 模块处理流程
+
+1. logger = logging.getLogger(name="x")   获取一个指定 name 的 logger 实例，name 与 logger 的关系是一一对应的，相同 name 调用两次，得到的是同一个 logger 实例。
+2. logger.debug(msg="debug msg")  调用 logger 下的接口打印日志。
+3. 在判断当前级别可以生成日志后，接下来会生成 LogRecord 实例 record， record 代表了当前打印这一行日志的对象，record 中除了记录了日志 msg 信息，还带有很多其他信息，比如 thread 线程号、threadName 线程名等等。
+4. 接下来由当前 logger 下添加过的 handlers 依次处理 record，`handler.handle(record)` 真正将每条日志输出到指定的位置，每个 handler 都可以设置对应的 **日志级别** 和 **格式**。
+
+本库在此流程上，主要增强了两部分功能：
+1. 提供 shinny_structlog.JSONFormatter，可以设置为任意 handler 的 formatter 类。
+2. logger.debug()、logger.info()、logger.warning()、logger.error()、logger.fatal()、logger.panic() 可以接受处理更多的参数
+
+
+## 本库遵循的日志规范
+
+* 每条日志都是一个 `json object` 且遵循 `json` 标准的 `utf-8` 编码，【不能】使用 `gb2312/gbk` 等其他编码格式。
+* 日志中的字段名【必须】使用小写英文字母，数字及下划线，对应的正则表达式描述为 `[a-z0-9_]`。
+* 每一条日志，默认包括的字段：
+    + msg - 事件描述，其唯一性【必须】可枚举，且【应】由一个或多个全小写英文单词组成（缩写除外：例如 "decode STEP"），并使用空格分隔。
+    + time - 时间，从 record.create 转为 RFC3339Nano 格式，例如 "2020-04-28T11:27:27.039781461+08:00"
+    + level - 日志级别分别为
+        - debug
+        - info
+        - warning
+        - error
+        - fatal
+        - panic
+    + name - logger 的 name 字段，为 getLogger 填入的参数
+
+
+## 安装 
+
+```
+pip install shinny-structlog
+```
+
+## 结构化
+
+所有日志输出都是 json 结构，在打印日志时，第一个参数为 msg （事件的唯一性描述），后面可以添加任意的键值对参数。
+
+`logger.debug('send_data', url="xxx", pack={}, ip="127.0.0.1", port=8080)`
+
+
+## 上下文
+
+有两种方式来表示 context 信息
+
+### 1. 打印日志，使用 extra 字段表示上下文信息。
+
+直接在 extra 关键字下填入一个 dict 对象，由用户自己管理 context 继承关系。自己的 context 需要先 copy，再调用 update 方法。
+
+```python
+api_context = {"strategy_id": 2, "strategy_name": "ma"}
+tqsdk_logger.debug("init", extra=api_context, init_balance=100000000.0)
+```
+
+```python
+# 使用 extra 关键字参数表示 context 信息
+api_context = {"strategy_id": 2, "strategy_name": "ma"}
+tqsdk_logger.debug("init", extra=api_context, init_balance=100000000.0)
+
+# 继承 context 信息，需要先 copy 父级的 context 信息，再添加子级需要的信息，使用 extra 关键字参数表示 context 信息
+md1_context = api_context.copy()
+md1_context["url"] = "wss://a.shinnytech.com"
+tqsdk_logger.info("received", extra=md1_context, pack={"aid":"rtn_data", "data":[{"quotes": {"SHFE.cu2001": {}}}]})
+```
+
+### 2. 使用 ShinnyLoggerAdapter 维护 context 信息
+
+* ShinnyLoggerAdapter 构造方法
+
+```
+logger = logging.getLogger("tqsdk")
+# 第一个参数为 logger ，后面可以接任意多个关键字参数
+adapter = ShinnyLoggerAdapter(logger, strategy_id=2, strategy_name="ma")
+```
+
+* ShinnyLoggerAdapter 之间的继承
+
+```
+logger = logging.getLogger("tqsdk")
+# 第一个参数为 logger ，后面可以接任意多个关键字参数
+adapter = ShinnyLoggerAdapter(logger, strategy_id=2, strategy_name="ma")
+# 调用 bind 方法，接任意多个关键字参数，返回一个新的 adapter, 其携带 context 信息包括父级 context 信息和 bind 添加的参数
+child_adapter = adapter.bind(user_name="tianqin", user_id="1009")
+```
+
+**注意**：
++ 如果子级 bind 的参数和父级参数同名，子级会覆盖父级同名的参数
++ 如果调用 `adapter.debug()/info()/warning()/error()/fatal()/panic()` 同时传入 extra 参数，那么 extra 会覆盖 adapter 中的相同关键字的 context 信息。
+
+
+## 日志源头及优先级
+
+使用本库，打印的每一条日志都是一个 `json object`，其内容有 4 个源头，按优先级从低到高依次是：
+
+#### 1. 使用 ShinnyLoggerAdapter 类添加的 context 信息。
+
+推荐使用 ShinnyLoggerAdapter, context 信息更明确，避免用户在使用 dict 时忘记 copy 或者 update 等简单错误。
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+    logger = shinny_structlog.ShinnyLoggerAdapter(tqsdk_logger, strategy_id=2, strategy_name="ma")
+    logger.debug("init", init_balance=100000000.0)
+
+# output:
+# {"strategy_id": 2, "strategy_name": "ma", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-01T17:19:33.115011+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+
+#### 2. extra 字段来表示的 context 信息
+
+使用本库时，可以使用 extra 字段来表示的 context 信息，
+
+分别参考：`examples/log_with_context.py` `examples/log_with_context_adapter.py`
+
+推荐使用 ShinnyLoggerAdapter, context 信息更明确，避免用户在使用 dict 时忘记 copy 或者 update 等简单错误。
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+    logger = shinny_structlog.ShinnyLoggerAdapter(tqsdk_logger, strategy_id=2, strategy_name="ma")
+    logger.debug("init", extra={"strategy_name": "ma5"}, init_balance=100000000.0)
+
+# output:
+# {"strategy_id": 2, "strategy_name": "ma5", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-01T17:19:33.115011+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+
+#### 3. logger.debug 时提供的字段
+
+`logger.debug()`、`logger.info()`、`logger.warning()`、`logger.error()`、`logger.fatal()`、`logger.panic()` 可以接受任意关键字参数。
+
+但是，有 4 个参数是 logging 模块本身就支持的，有特别含义：
+
++ extra: dict 类型，用来表示 context 信息。
++ exc_info: bool 或者 exception 类型，默认值 None。如果是 Exception 实例，则打印该异常信息；如果是 True，则调用 `sys.exc_info()` 获取异常信息后打印。
++ stack_info：bool 类型，默认值 False，输出调用栈信息。
++ stacklevel: int 类型，在 3.8 版新增，默认为 1。如果大于 1，则在为日志记录时，将跳过相应数量的调用栈。
+
+示例 - 优先级：
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+    logger = shinny_structlog.ShinnyLoggerAdapter(tqsdk_logger, strategy_id=2, strategy_name="ma")
+    logger.debug("init", extra={"md_url": "wss://aaa.shinnytech.com"}, md_url="wss://bbb.shinnytech.com")  # 这里的 md_url 会覆盖 extra.md_url
+
+# output
+# {"strategy_id": 2, "strategy_name": "ma", "md_url": "wss://bbb.shinnytech.com", "msg": "init", "time": "2020-09-01T17:32:15.628907+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+
+示例 - 打印调用栈或者异常信息：
+
+```python
+import logging
+import shinny_structlog
+
+def subscribe_quote(symbols):
+    try:
+        symbols = symbols - ["DCE.a"]  # TypeError: unsupported operand type(s) for -: 'list' and 'list'"
+        pack = {
+            "aid": "subscribe_quote",
+            "ins_list": ",".join(symbols)
+        }
+        # api.send_pack(pack)  # 发送数据包
+        tqsdk_logger.debug("send data", extra=api_context, stack_info=1, pack=pack)  # 记录日志，同时会打印出调用栈信息
+    except Exception as e:
+        tqsdk_logger.debug("send data", extra=api_context, exc_info=e)  # 记录日志，打印出 Exception
+        # tqsdk_logger.debug("send data", extra=api_context, exc_info=True)  # 记录日志，也会打印出和上一行一样的信息
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+    api_context = {"strategy_id": 2, "strategy_name": "ma", "md_url": "wss://aaa.shinnytech.com"}
+    tqsdk_logger.debug("init", extra=api_context, init_balance=100000000.0)  # 每次打印日志，都将 context 信息用 extra 传给 logger
+
+    subscribe_quote(["SHFE.cu2002", "SHFE.au2002"])
+
+# output
+# {"strategy_id": 2, "strategy_name": "ma", "md_url": "wss://aaa.shinnytech.com", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-01T17:17:26.627757+08:00", "level": "debug", "name": "tqsdk"}
+# {"msg": "send data", "time": "2020-09-01T17:17:26.627924+08:00", "level": "debug", "name": "tqsdk", "exc_info": "Traceback (most recent call last):\n  File \"/Users/yanqiongma/Documents/WorkSpace/structlog-python/examples/log_with_context.py\", line 7, in subscribe_quote\n    symbols = symbols - [\"DCE.a\"]\nTypeError: unsupported operand type(s) for -: 'list' and 'list'"}```
+```
+
+
+#### 4. shinny_structlog.JSONFormatter 自动生成的字段
+
+shinny_structlog.JSONFormatter 会为每条 json 日志添加 `msg`、`time`、`level`、`name` 这几个字段。
+
++ msg - 事件描述，其唯一性【必须】可枚举。为 logger.debug() 中第一个参数
++ time - 从 record.create 转为 RFC3339Nano 格式，例如 "2020-04-28T11:27:27.039781461+08:00"
++ level - debug、info、warning、error、fatal、panic 其中之一
++ name - logger 的 name 字段，为 getLogger 填入的参数
+
+**注意**：
+time 字段默认使用机器本地时区，如何主动设置时区信息？设置环境变量 TZ，datetime 模块就会采用设置的 TZ 来输出时间的时区信息。
+
+环境变量 TZ 设置的格式，可以参考文档 `https://docs.python.org/3/library/time.html#time.tzset`
+
+比如：东八区可以设置为 `CST-08`
+
+
+另外在 JSONFormatter 初始化时，还可以接受一个列表参数，来添加由 LogRecord 生成的属性信息。 
+
+可以添加的属性值有：
+
++ created - LogRecord 被创建的时间（即 time.time() 的返回值）
++ filename - pathname 的文件名部分
++ func_name - 调用 logger 的函数名
++ levelno - 日志级别的数字表示
++ lineno - 发出日志记录调用所在的源行号（如果可用）
++ module - 模块名 (filename 的名称部分)
++ msecs - LogRecord 被创建的时间的毫秒部分
++ pathname - 发出日志记录调用的源文件的完整路径名（如果可用）
++ process - 进程ID（如果可用）
++ process_name - 进程名（如果可用）
++ relative_created - 以毫秒数表示的 LogRecord 被创建的时间，即相对于 logging 模块被加载时间的差值。
++ thread - 线程ID（如果可用）
++ thread_name - 线程名（如果可用）
+
+示例 - 优先级：
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter(["module"]))  # 这里 module 的优先级最高
+    tqsdk_logger.addHandler(sh)
+
+    api_context = {"module":"api", "md_url": "wss://aaa.shinnytech.com"}
+    tqsdk_logger.debug("init", extra=api_context, md_url="wss://bbb.shinnytech.com", module="tqsdk")  # 这里的 module 会被 formatter 中 record 自动生成的 module 覆盖
+
+# output
+# {"module": "log_params_priority", "md_url": "wss://bbb.shinnytech.com", "msg": "init", "time": "2020-09-01T17:51:32.781189+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+
+## 使用示例及注意事项
+
+### 不使用本日志库
+
+默认日志输出到控制台，python 默认输出的 logging.WARNING 级别的日志, 只输出 msg 字符串
+
+```python
+import logging
+
+if __name__ == "__main__":
+    logger = logging.getLogger()
+    logger.info("info")  # 看不到此行输出信息
+    logger.warning("warning")
+    logger.error("error")
+    logger.error("error %s %s", 'xxx', 'yyy')
+
+# 输出
+# warning
+# error
+# error xxx yyy
+```
+
+### 结构化日志
+
+`shinny_structlog.JSONFormatter` 可以将输出的日志格式化为 json 格式。
+
+```python
+
+import logging
+import shinny_structlog
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()  # 输出到控制台前端
+    sh.setLevel(logging.INFO)  # logging.INFO 级别
+
+    fmt = shinny_structlog.JSONFormatter
+    sh.setFormatter(fmt())
+    tqsdk_logger.addHandler(sh)
+
+    tqsdk_logger.info("connected")
+    tqsdk_logger.warning("connected")
+    tqsdk_logger.error("connected")
+    tqsdk_logger.fatal("connected")
+    tqsdk_logger.panic("connected")
+
+    tqsdk_logger.log(27, "connected")
+
+# output
+# {"msg": "connected", "time": "2020-08-31T18:28:15.304480+08:00", "level": "info", "name": "tqsdk"}
+# {"msg": "connected", "time": "2020-08-31T18:28:15.304681+08:00", "level": "warning", "name": "tqsdk"}
+# {"msg": "connected", "time": "2020-08-31T18:28:15.304787+08:00", "level": "error", "name": "tqsdk"}
+# {"msg": "connected", "time": "2020-08-31T18:28:15.304879+08:00", "level": "fatal", "name": "tqsdk"}
+# {"msg": "connected", "time": "2020-08-31T18:28:15.304971+08:00", "level": "panic", "name": "tqsdk"}
+# {"msg": "connected", "time": "2020-08-31T18:28:15.305065+08:00", "level": "info", "name": "tqsdk"}
+```
+
+
+设置日志为 json 格式，输出到日志文件
+```python
+import logging
+import shinny_structlog
+if __name__ == "__main__":
+
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    fh = logging.FileHandler(filename="testprint.log")
+    fh.setLevel(logging.DEBUG)
+    fmt = shinny_structlog.JSONFormatter
+    fh.setFormatter(fmt())
+    tqsdk_logger.addHandler(fh)
+
+    tqsdk_logger.error("connected error", url="xxx.com", user="abc")
+
+# 输出到 testprint.log
+# {"url": "xxx.com", "user": "abc", "msg": "connected error", "time": "2020-08-31T12:15:31.519445+08:00", "level": "error", "name": "tqsdk"}
+```
+
+
+### 日志添加额外字段
+
+打印每条日志，都可以添加任意个的健值对参数。每个参数名都必须符合日志规范，【必须】使用小写英文字母，数字及下划线，对应的正则表达式描述为 `[a-z0-9_]`。
+
+```python
+import logging
+import shinny_structlog
+if __name__ == "__main__":
+
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    tqsdk_logger.error("connected error", url="xxx.com", user="abc")
+
+# output
+# {"url": "xxx.com", "user": "abc", "msg": "connected error", "time": "2020-08-31T12:15:31.519445+08:00", "level": "error", "name": "tqsdk"}
+```
+
+
+### LogRecord 本身带有的属性
+
+在 JSONFormatter 初始化，可以提供一个 list 类型的参数，表示在生成 json 字符串中添加 LogRecord 对应的字段。
+
+注意：logging 模块属性名采用驼峰标识，shinny_structlog 的日志规范采用小写字母加下划线，此处将 LogRecord 中驼峰标识的属性，转为小写字母加下划线。
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    fmt = shinny_structlog.JSONFormatter
+    # 打印的每条日志都会至少包含 "msg" "time" "level" "name" 以及 "module" "line_no" "thread_name" 这7个字段
+    sh.setFormatter(fmt(["module", "line_no", "thread_name"])) 
+    tqsdk_logger.addHandler(sh)
+
+    tqsdk_logger.debug("xxx")
+
+# output
+# {"msg": "xxx", "time": "2020-08-31T18:44:34.087702+08:00", "level": "debug", "name": "tqsdk", "module": "example", "line_no": 15, "thread_name": "MainThread"}
+```
+
+
+## 上下文表示
+
+1. 打印日志时，使用 extra 字段表示上下文信息。
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+
+    api_context = {"strategy_id": 2, "strategy_name": "ma"}
+    tqsdk_logger.debug("init", extra=api_context, init_balance=100000000.0)
+
+# output
+# {"strategy_id": 2, "strategy_name": "ma", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-01T17:55:47.532228+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+2. 使用 ShinnyLoggerAdapter 维护 context 信息
+
+```python
+import logging
+from shinny_structlog import ShinnyLoggerAdapter, JSONFormatter
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+    tqsdk_logger_adapter = ShinnyLoggerAdapter(tqsdk_logger, strategy_id=2, strategy_name="ma")
+    tqsdk_logger_adapter.debug("init", init_balance=100000000.0)
+
+# output
+# {"strategy_id": 2, "strategy_name": "ma", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-07T16:51:28.124017+08:00", "level": "debug", "name": "tqsdk"}
+```
+
+
+## 上下文继承
+
+有两种方式来表示 context 的继承关系：
+
+1. 直接使用 dict 对象，由用户自己管理 context 继承关系
+
+```python
+import logging
+import shinny_structlog
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(shinny_structlog.JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+
+    api_context = {"strategy_id": 2, "strategy_name": "ma"}
+    tqsdk_logger.debug("init", extra=api_context, init_balance=100000000.0)
+
+    # 继承 context 信息，需要先 copy 父级的 context 信息，再添加子级需要的信息，使用 extra 关键字参数表示 context 信息
+    md1_context = api_context.copy()
+    md1_context["url"] = "wss://a.shinnytech.com"
+    tqsdk_logger.info("received", extra=md1_context, pack={"aid":"rtn_data", "data":[{"quotes": {"SHFE.cu2001": {}}}]})
+
+    md2_context = api_context.copy()
+    md2_context["url"] = "wss://b.shinnytech.com"
+    tqsdk_logger.info("received", extra=md2_context, pack={"aid":"rtn_data", "data":[{"quotes": {"SHFE.cu2012": {}}}]})
+
+# output
+# {"strategy_id": 2, "strategy_name": "ma", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-01T17:55:47.532228+08:00", "level": "debug", "name": "tqsdk"}
+# {"strategy_id": 2, "strategy_name": "ma", "url": "wss://a.shinnytech.com", "pack": {"aid": "rtn_data", "data": [{"quotes": {"SHFE.cu2001": {}}}]}, "msg": "received", "time": "2020-09-01T17:55:47.532424+08:00", "level": "info", "name": "tqsdk"}
+# {"strategy_id": 2, "strategy_name": "ma", "url": "wss://b.shinnytech.com", "pack": {"aid": "rtn_data", "data": [{"quotes": {"SHFE.cu2012": {}}}]}, "msg": "received", "time": "2020-09-01T17:55:47.532507+08:00", "level": "info", "name": "tqsdk"}```
+```
+
+2. 使用 ShinnyLoggerAdapter 维护 context 继承关系
+
+```python
+import logging
+from shinny_structlog import ShinnyLoggerAdapter, JSONFormatter
+
+if __name__ == "__main__":
+    tqsdk_logger = logging.getLogger("tqsdk")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.NOTSET)
+    sh.setFormatter(JSONFormatter())
+    tqsdk_logger.addHandler(sh)
+
+    # 使用 extra 关键字参数表示 context 信息
+    tqsdk_logger_adapter = ShinnyLoggerAdapter(tqsdk_logger, strategy_id=2, strategy_name="ma")
+    tqsdk_logger_adapter.debug("init", init_balance=100000000.0)
+    tqsdk_logger_adapter.debug("init", extra={"strategy_name": "tqsdk_ma"}, init_balance=100000000.0)  # debug 中 extra 会覆盖 ShinnyLoggerAdapter 中同名的参数
+
+    # 继承 context 信息，调用 tqsdk_logger.bind
+    # 继承 tqsdk_logger_adapter 中的 context, 并且再添加两个字段
+    md1_logger_adapter = tqsdk_logger_adapter.bind(url="wss://a.shinnytech.com", ip="127.0.0.1")
+    md1_logger_adapter.info("received", pack={"aid": "rtn_data", "data": [{"quotes": {"SHFE.cu2001": {}}}]})
+
+    md2_logger_adapter = tqsdk_logger_adapter.bind(url="wss://b.shinnytech.com", ip="127.0.0.1")
+    md2_logger_adapter.info("received", pack={"aid":"rtn_data", "data":[{"quotes": {"SHFE.cu2012": {}}}]})
+
+# ouput
+# {"strategy_id": 2, "strategy_name": "ma", "init_balance": 100000000.0, "msg": "init", "time": "2020-09-07T16:52:12.825100+08:00", "level": "debug", "name": "tqsdk"}
+# {"strategy_name": "tqsdk_ma", "strategy_id": 2, "init_balance": 100000000.0, "msg": "init", "time": "2020-09-07T16:52:12.825390+08:00", "level": "debug", "name": "tqsdk"}
+# {"strategy_id": 2, "strategy_name": "ma", "url": "wss://a.shinnytech.com", "ip": "127.0.0.1", "pack": {"aid": "rtn_data", "data": [{"quotes": {"SHFE.cu2001": {}}}]}, "msg": "received", "time": "2020-09-07T16:52:12.825478+08:00", "level": "info", "name": "tqsdk"}
+# {"strategy_id": 2, "strategy_name": "ma", "url": "wss://b.shinnytech.com", "ip": "127.0.0.1", "pack": {"aid": "rtn_data", "data": [{"quotes": {"SHFE.cu2012": {}}}]}, "msg": "received", "time": "2020-09-07T16:52:12.825558+08:00", "level": "info", "name": "tqsdk"}
+```
+

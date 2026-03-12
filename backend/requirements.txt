@@ -1,0 +1,5 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+tqsdk>=3.7.0
+tqsdk-zq-otg
+
